@@ -1,59 +1,27 @@
-from flask import Flask, render_template, request, jsonify, Response, session
-from openai import AzureOpenAI
 import os
-import json
 import time
-import typing as t
+import traceback
+from flask import Flask, render_template, request, jsonify, session
 from datetime import timedelta
-from pathlib import Path
+from openai import AzureOpenAI
+import httpx
 from dotenv import load_dotenv
+from pathlib import Path
 
+# Cargar variables desde .env
+load_dotenv(dotenv_path=Path('.') / '.env')
 
-env_path = Path('.') / '.env'
-load_dotenv(dotenv_path=env_path)
-
-print("🔍 DEBUG ENV:", os.getenv("AZURE_OPENAI_API_KEY"))
-
-# Configuración quemada (por ahora)
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
-AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-
-# Validar que estén definidas
-missing = []
-for var, val in {
-    "AZURE_OPENAI_API_KEY": AZURE_OPENAI_API_KEY,
-    "AZURE_OPENAI_ENDPOINT": AZURE_OPENAI_ENDPOINT,
-    "AZURE_OPENAI_DEPLOYMENT_NAME": AZURE_OPENAI_DEPLOYMENT_NAME
-}.items():
-    if not val:
-        missing.append(var)
-
-if missing:
-    raise RuntimeError(f"⚠️ Faltan variables en .env: {', '.join(missing)}")
-
+# Inicializar cliente Azure OpenAI con API Key
 client = AzureOpenAI(
-    api_key=AZURE_OPENAI_API_KEY,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version=AZURE_OPENAI_API_VERSION,
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview"),
+    http_client=httpx.Client(verify=False)  # ⚠️ para desarrollo local sin certificados
 )
-
-print("✅ Cliente Azure OpenAI configurado con API Key")
 
 app = Flask(__name__)
 app.secret_key = "dev-secret-hardcoded"
 app.permanent_session_lifetime = timedelta(days=7)
-
-def _get_or_create_conversation_id(passed_conversation_id: t.Optional[str]) -> str:
-    if passed_conversation_id:
-        session["conversation_id"] = passed_conversation_id
-        return passed_conversation_id
-    if "conversation_id" in session and session["conversation_id"]:
-        return session["conversation_id"]
-    conversation_id = f"conv_{int(time.time())}_{os.getpid()}"
-    session["conversation_id"] = conversation_id
-    return conversation_id
 
 @app.route("/")
 def index():
@@ -64,8 +32,57 @@ def new_conversation():
     conversation_id = f"conv_{int(time.time())}_{os.getpid()}"
     session.clear()
     session["conversation_id"] = conversation_id
-    session["messages"] = []  # Limpiar historial
+    session["messages"] = []
     return jsonify({"conversation_id": conversation_id})
+
+# @app.route("/chat", methods=["POST"])
+# def chat():
+#     try:
+#         data = request.get_json(silent=True) or {}
+#         user_message = (data.get("message") or "").strip()
+#         passed_conversation_id = data.get("conversation_id")
+
+#         if not user_message:
+#             return jsonify({"error": "No message provided"}), 400
+
+#         conversation_id = passed_conversation_id or session.get("conversation_id")
+#         if not conversation_id:
+#             conversation_id = f"conv_{int(time.time())}_{os.getpid()}"
+#             session["conversation_id"] = conversation_id
+#             session["messages"] = []
+
+#         messages = session.get("messages", [])
+
+#         if not messages:
+#             messages.append({
+#                 "role": "system",
+#                 "content": "Eres un asistente experto en información de Colombia."
+#             })
+
+#         messages.append({"role": "user", "content": user_message})
+
+#         response = client.chat.completions.create(
+#             model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),  # ← el nombre del deployment
+#             messages=messages,
+#             temperature=0.7,
+#             max_tokens=1000,
+#             top_p=1
+#         )
+
+#         assistant_message = response.choices[0].message.content
+
+#         messages.append({"role": "assistant", "content": assistant_message})
+#         session["messages"] = messages
+
+#         return jsonify({
+#             "conversation_id": conversation_id,
+#             "response": assistant_message
+#         })
+
+#     except Exception as e:
+#         print("❌ Excepción en /chat:", repr(e))
+#         traceback.print_exc()
+#         return jsonify({"error": f"{type(e).__name__}: {str(e)}"}), 500
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -77,38 +94,55 @@ def chat():
         if not user_message:
             return jsonify({"error": "No message provided"}), 400
 
-        conversation_id = _get_or_create_conversation_id(passed_conversation_id)
+        # Obtener el assistant_id del .env
+        assistant_id = os.getenv("AZURE_OPENAI_ASSISTANT_ID")
 
-        # Obtener historial de mensajes de la sesión
-        messages = session.get("messages", [])
+        # Crear un nuevo thread si no hay uno activo
+        if "thread_id" not in session:
+            thread = client.beta.threads.create()
+            session["thread_id"] = thread.id
 
-        # Instrucción general si no hay historial
-        if not messages:
-            system_instruction = "Eres un asistente útil y conversacional, puedes hablar sobre cualquier tema con conocimiento general."
-            messages.append({"role": "system", "content": system_instruction})
+        thread_id = session["thread_id"]
 
-        messages.append({"role": "user", "content": user_message})
-
-        response = client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT_NAME,
-            messages=messages,
-            temperature=0.7,
-            max_tokens=1000,
-            top_p=1,
+        # Agregar mensaje del usuario al thread
+        client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=user_message
         )
 
-        assistant_message = response.choices[0].message.content
-        messages.append({"role": "assistant", "content": assistant_message})
-        session["messages"] = messages
+        # Lanzar ejecución del assistant
+        run = client.beta.threads.runs.create(
+            thread_id=thread_id,
+            assistant_id=assistant_id
+        )
+
+        # Esperar a que termine la ejecución
+        while run.status in ["queued", "in_progress"]:
+            time.sleep(1)
+            run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+
+        if run.status != "completed":
+            return jsonify({"error": f"Assistant run failed: {run.status}"}), 500
+
+        # Obtener los mensajes del thread (último mensaje es la respuesta)
+        messages = client.beta.threads.messages.list(thread_id=thread_id)
+        assistant_message = next(
+            (m.content[0].text.value for m in reversed(messages.data) if m.role == "assistant"),
+            "No response from assistant."
+        )
 
         return jsonify({
-            "conversation_id": conversation_id,
+            "conversation_id": passed_conversation_id or session.get("conversation_id"),
             "response": assistant_message
         })
 
     except Exception as e:
+        print("❌ Excepción en /chat:", repr(e))
+        traceback.print_exc()
         return jsonify({"error": f"{type(e).__name__}: {str(e)}"}), 500
 
+
 if __name__ == "__main__":
-    print("\U0001F680 Chatbot general con Azure OpenAI")
+    print("🚀 Flask chatbot con Azure OpenAI (chat.completions)")
     app.run(debug=True, port=5000)
