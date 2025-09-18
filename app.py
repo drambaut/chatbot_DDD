@@ -16,7 +16,7 @@ client = AzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview"),
-    http_client=httpx.Client(verify=False)  # ⚠️ para desarrollo local sin certificados
+    http_client=httpx.Client(verify=False)
 )
 
 app = Flask(__name__)
@@ -34,55 +34,6 @@ def new_conversation():
     session["conversation_id"] = conversation_id
     session["messages"] = []
     return jsonify({"conversation_id": conversation_id})
-
-# @app.route("/chat", methods=["POST"])
-# def chat():
-#     try:
-#         data = request.get_json(silent=True) or {}
-#         user_message = (data.get("message") or "").strip()
-#         passed_conversation_id = data.get("conversation_id")
-
-#         if not user_message:
-#             return jsonify({"error": "No message provided"}), 400
-
-#         conversation_id = passed_conversation_id or session.get("conversation_id")
-#         if not conversation_id:
-#             conversation_id = f"conv_{int(time.time())}_{os.getpid()}"
-#             session["conversation_id"] = conversation_id
-#             session["messages"] = []
-
-#         messages = session.get("messages", [])
-
-#         if not messages:
-#             messages.append({
-#                 "role": "system",
-#                 "content": "Eres un asistente experto en información de Colombia."
-#             })
-
-#         messages.append({"role": "user", "content": user_message})
-
-#         response = client.chat.completions.create(
-#             model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),  # ← el nombre del deployment
-#             messages=messages,
-#             temperature=0.7,
-#             max_tokens=1000,
-#             top_p=1
-#         )
-
-#         assistant_message = response.choices[0].message.content
-
-#         messages.append({"role": "assistant", "content": assistant_message})
-#         session["messages"] = messages
-
-#         return jsonify({
-#             "conversation_id": conversation_id,
-#             "response": assistant_message
-#         })
-
-#     except Exception as e:
-#         print("❌ Excepción en /chat:", repr(e))
-#         traceback.print_exc()
-#         return jsonify({"error": f"{type(e).__name__}: {str(e)}"}), 500
 
 @app.route("/chat", methods=["POST"])
 def chat():
