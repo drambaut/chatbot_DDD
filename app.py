@@ -1,92 +1,158 @@
 import os
 import time
 import traceback
-from flask import Flask, render_template, request, jsonify, session
 from datetime import timedelta
-from openai import AzureOpenAI
-import httpx
-from dotenv import load_dotenv
 from pathlib import Path
 
-# Cargar variables desde .env
-load_dotenv(dotenv_path=Path('.') / '.env')
+from dotenv import load_dotenv
+from flask import Flask, jsonify, render_template, request, session
+from openai import AzureOpenAI
 
-# Inicializar cliente Azure OpenAI con API Key
+BASE_DIR = Path(__file__).parent.resolve()
+load_dotenv(BASE_DIR / ".env")
+
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+ASSISTANT_ID = os.getenv("AZURE_OPENAI_ASSISTANT_ID", "")
+
+if not (AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT and ASSISTANT_ID):
+    raise RuntimeError(
+        "Faltan variables de entorno: AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_ASSISTANT_ID"
+    )
+
 client = AzureOpenAI(
-    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview"),
-    http_client=httpx.Client(verify=False)
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=AZURE_OPENAI_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    timeout=60,
 )
 
-app = Flask(__name__)
-app.secret_key = "dev-secret-hardcoded"
-app.permanent_session_lifetime = timedelta(days=7)
+# Señalamos explícitamente la carpeta 'templates'
+app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "super-secret-key")  # cambia en prod
+app.permanent_session_lifetime = timedelta(hours=8)
+
+def _extract_text_from_message(message) -> str:
+    """Extrae texto plano de los 'content' de tipo 'text' de un mensaje."""
+    parts = []
+    for c in getattr(message, "content", []) or []:
+        if getattr(c, "type", None) == "text":
+            t = getattr(getattr(c, "text", None), "value", None)
+            if t:
+                parts.append(t)
+    return "\n".join(parts).strip()
+
+
+def _get_latest_assistant_text(thread_id: str) -> str:
+    """
+    Devuelve SIEMPRE el texto de la respuesta MÁS RECIENTE del asistente
+    dentro del thread. (Fix al problema de respuestas repetidas/antiguas).
+    """
+    messages = client.beta.threads.messages.list(
+        thread_id=thread_id, order="desc", limit=50  # del más nuevo al más viejo
+    )
+    for m in messages.data:
+        if m.role == "assistant":
+            txt = _extract_text_from_message(m)
+            if txt:
+                return txt
+    return "No response from assistant."
+
+
+def _wait_for_run_completion(thread_id: str, run_id: str, timeout_s: int = 60) -> str:
+    """
+    Espera a que el run termine. Devuelve el status final.
+    Maneja estados comunes y corta por timeout si excede el tiempo.
+    """
+    t0 = time.time()
+    while True:
+        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
+        status = run.status
+
+        if status in ("completed", "failed", "cancelled", "expired"):
+            return status
+        if status == "requires_action":
+            # Si tu assistant usa herramientas, acá deberías manejarlas.
+            return status
+
+        if time.time() - t0 > timeout_s:
+            return "timeout"
+
+        time.sleep(0.8)
 
 @app.route("/")
 def index():
     return render_template("chat.html")
 
-@app.route("/conversation/new", methods=["POST"])
-def new_conversation():
-    conversation_id = f"conv_{int(time.time())}_{os.getpid()}"
+
+@app.route("/reset", methods=["POST"])
+def reset():
     session.clear()
-    session["conversation_id"] = conversation_id
-    session["messages"] = []
-    return jsonify({"conversation_id": conversation_id})
+    return jsonify({"ok": True})
+
 
 @app.route("/chat", methods=["POST"])
 def chat():
+    """
+    Recibe un 'message' del usuario, lo agrega al thread y devuelve
+    la respuesta MÁS RECIENTE del asistente.
+    """
     try:
         data = request.get_json(silent=True) or {}
         user_message = (data.get("message") or "").strip()
-        passed_conversation_id = data.get("conversation_id")
 
         if not user_message:
-            return jsonify({"error": "No message provided"}), 400
+            return jsonify({"error": "Mensaje vacío."}), 400
 
-        # Obtener el assistant_id del .env
-        assistant_id = os.getenv("AZURE_OPENAI_ASSISTANT_ID")
-
-        # Crear un nuevo thread si no hay uno activo
+        # Crear/recuperar thread en la sesión
         if "thread_id" not in session:
             thread = client.beta.threads.create()
             session["thread_id"] = thread.id
 
         thread_id = session["thread_id"]
 
-        # Agregar mensaje del usuario al thread
+        # Añadir mensaje del usuario
         client.beta.threads.messages.create(
             thread_id=thread_id,
             role="user",
-            content=user_message
+            content=user_message,
         )
 
-        # Lanzar ejecución del assistant
+        # Ejecutar assistant
         run = client.beta.threads.runs.create(
             thread_id=thread_id,
-            assistant_id=assistant_id
+            assistant_id=ASSISTANT_ID,
         )
 
-        # Esperar a que termine la ejecución
-        while run.status in ["queued", "in_progress"]:
-            time.sleep(1)
-            run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+        # Esperar finalización
+        final_status = _wait_for_run_completion(thread_id, run.id, timeout_s=90)
 
-        if run.status != "completed":
-            return jsonify({"error": f"Assistant run failed: {run.status}"}), 500
+        if final_status == "completed":
+            assistant_text = _get_latest_assistant_text(thread_id)
+            return jsonify(
+                {"thread_id": thread_id, "status": final_status, "response": assistant_text}
+            )
 
-        # Obtener los mensajes del thread (último mensaje es la respuesta)
-        messages = client.beta.threads.messages.list(thread_id=thread_id)
-        assistant_message = next(
-            (m.content[0].text.value for m in reversed(messages.data) if m.role == "assistant"),
-            "No response from assistant."
+        if final_status == "requires_action":
+            return jsonify(
+                {
+                    "thread_id": thread_id,
+                    "status": final_status,
+                    "response": "El asistente requiere una acción adicional (herramientas).",
+                }
+            )
+
+        return (
+            jsonify(
+                {
+                    "thread_id": thread_id,
+                    "status": final_status,
+                    "response": f"No se pudo completar la ejecución (status={final_status}).",
+                }
+            ),
+            500,
         )
-
-        return jsonify({
-            "conversation_id": passed_conversation_id or session.get("conversation_id"),
-            "response": assistant_message
-        })
 
     except Exception as e:
         print("❌ Excepción en /chat:", repr(e))
@@ -95,5 +161,5 @@ def chat():
 
 
 if __name__ == "__main__":
-    print("🚀 Flask chatbot con Azure OpenAI (chat.completions)")
-    app.run(debug=True, port=5000)
+    print("🚀 Flask chatbot con Azure OpenAI Assistants")
+    app.run(host="0.0.0.0", port=5000, debug=True)
